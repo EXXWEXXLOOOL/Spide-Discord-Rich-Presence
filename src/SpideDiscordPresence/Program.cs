@@ -128,36 +128,47 @@ internal static class Program
 
             var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
 
-            // Litterbox accepts anonymous uploads and returns a temporary public URL.
-            // Catbox is retained as a fallback in case the temporary-upload endpoint is unavailable.
-            foreach (var endpoint in new[]
-            {
-                ("https://litterbox.catbox.moe/resources/internals/api.php", true),
-                ("https://catbox.moe/user/api.php", false)
-            })
+            // beacon.host returns a direct public file URL; anonymous links last 24 hours.
+            // Keep Litterbox and Catbox as fallbacks for networks where beacon.host is unavailable.
+            foreach (var host in new[] { "beacon", "litterbox", "catbox" })
             {
                 try
                 {
                     using var form = new MultipartFormDataContent();
-                    form.Add(new StringContent("fileupload"), "reqtype");
-                    if (endpoint.Item2) form.Add(new StringContent("72h"), "time");
-                    var file = new ByteArrayContent(bytes);
-                    form.Add(file, "fileToUpload", $"spide-cover.{extension}");
+                    string endpoint;
+                    if (host == "beacon")
+                    {
+                        endpoint = "https://beacon.host/v1/upload";
+                        var file = new ByteArrayContent(bytes);
+                        form.Add(file, "file", $"spide-cover.{extension}");
+                    }
+                    else
+                    {
+                        endpoint = host == "litterbox"
+                            ? "https://litterbox.catbox.moe/resources/internals/api.php"
+                            : "https://catbox.moe/user/api.php";
+                        form.Add(new StringContent("fileupload"), "reqtype");
+                        if (host == "litterbox") form.Add(new StringContent("72h"), "time");
+                        var file = new ByteArrayContent(bytes);
+                        form.Add(file, "fileToUpload", $"spide-cover.{extension}");
+                    }
 
-                    using var response = await Http.PostAsync(endpoint.Item1, form);
+                    using var response = await Http.PostAsync(endpoint, form);
                     var body = (await response.Content.ReadAsStringAsync()).Trim();
-                    response.EnsureSuccessStatusCode();
+                    if (!response.IsSuccessStatusCode)
+                        throw new HttpRequestException($"HTTP {(int)response.StatusCode} ({response.StatusCode}): {body}");
+
                     if (!Uri.TryCreate(body, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeHttps)
                         throw new IOException($"Image host returned an unexpected response: {body}");
 
                     ArtworkCache[hash] = body;
                     ArtworkRetryAfter.Remove(hash);
-                    Console.WriteLine("Track cover uploaded successfully.");
+                    Console.WriteLine($"Track cover uploaded successfully via {host}.");
                     return body;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Cover host {new Uri(endpoint.Item1).Host} failed: {DescribeException(ex)}");
+                    Console.WriteLine($"Cover host {host} failed: {DescribeException(ex)}");
                 }
             }
 
