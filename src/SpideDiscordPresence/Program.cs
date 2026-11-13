@@ -1,35 +1,25 @@
-using DiscordRPC;
-using DiscordRPC.Logging;
+using System.IO.Pipes;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Windows.Media.Control;
+using Windows.Storage.Streams;
 
 namespace SpideDiscordPresence;
 
 internal static class Program
 {
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(20) };
+    private static readonly Dictionary<string, string> ArtworkCache = new();
+
     private static async Task Main()
     {
         Console.Title = "Spide → Discord Rich Presence";
-        var appId = Environment.GetEnvironmentVariable("DISCORD_APP_ID")
-            ?? ReadSetting("discordAppId");
-        var imageKey = ReadSetting("discordImageKey") ?? "spide";
-
+        var appId = Environment.GetEnvironmentVariable("DISCORD_APP_ID") ?? ReadSetting("discordAppId");
         if (string.IsNullOrWhiteSpace(appId))
         {
             Console.WriteLine("Set DISCORD_APP_ID or add discordAppId to config.json.");
-            Console.WriteLine("Create an application at https://discord.com/developers/applications");
-            Console.WriteLine("Press any key to exit.");
             Console.ReadKey();
-            return;
-        }
-
-        using var rpc = new DiscordRpcClient(appId)
-        {
-            Logger = new ConsoleLogger { Level = LogLevel.Warning }
-        };
-
-        if (!rpc.Initialize())
-        {
-            Console.WriteLine("Could not connect to Discord. Make sure the Discord desktop app is running.");
             return;
         }
 
@@ -44,10 +34,15 @@ internal static class Program
             return;
         }
 
-        Console.WriteLine("Connected. Waiting for Spide playback…");
-        string? lastFingerprint = null;
-        var hadPresence = false;
+        await using var rpc = new DiscordIpcClient(appId);
+        if (!await rpc.ConnectAsync())
+        {
+            Console.WriteLine("Could not connect to Discord. Start the Discord desktop app and try again.");
+            return;
+        }
 
+        Console.WriteLine("Connected to Discord. Waiting for Spide playback…");
+        string? lastFingerprint = null;
         while (true)
         {
             try
@@ -58,8 +53,7 @@ internal static class Program
 
                 if (session is null)
                 {
-                    if (hadPresence) rpc.ClearPresence();
-                    hadPresence = false;
+                    if (lastFingerprint is not null) await rpc.SetActivityAsync(null);
                     lastFingerprint = null;
                 }
                 else
@@ -68,50 +62,37 @@ internal static class Program
                     var playback = session.GetPlaybackInfo();
                     var timeline = session.GetTimelineProperties();
 
-                    var title = string.IsNullOrWhiteSpace(properties.Title) ? "Unknown track" : properties.Title;
-                    var artist = string.IsNullOrWhiteSpace(properties.Artist) ? "Unknown artist" : properties.Artist;
-                    var isPlaying = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+                    var title = string.IsNullOrWhiteSpace(properties.Title) ? "Unknown track" : properties.Title.Trim();
+                    var artist = string.IsNullOrWhiteSpace(properties.Artist) ? "Unknown artist" : properties.Artist.Trim();
+                    var playing = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
                     var duration = timeline.EndTime - timeline.StartTime;
                     var position = timeline.Position;
-                    var fingerprint = $"{session.SourceAppUserModelId}|{title}|{artist}|{isPlaying}|{timeline.EndTime.Ticks}";
+                    var imageUrl = await GetArtworkUrlAsync(properties.Thumbnail);
+                    var fingerprint = $"{session.SourceAppUserModelId}|{title}|{artist}|{playing}|{timeline.EndTime.Ticks}|{imageUrl}";
 
                     if (fingerprint != lastFingerprint)
                     {
-                        if (isPlaying)
-                        {
-                            var start = DateTime.UtcNow - position;
-                            var end = DateTime.UtcNow + (timeline.EndTime - position);
-                            rpc.SetPresence(new RichPresence
-                            {
-                                Details = title,
-                                State = artist,
-                                Timestamps = duration > TimeSpan.Zero
-                                    ? new Timestamps { Start = start, End = end }
-                                    : new Timestamps { Start = start },
-                                Assets = new Assets
-                                {
-                                    LargeImageKey = imageKey,
-                                    LargeImageText = "Spide"
-                                }
-                            });
-                        }
-                        else
-                        {
-                            rpc.SetPresence(new RichPresence
-                            {
-                                Details = title,
-                                State = $"{artist} • Paused",
-                                Assets = new Assets
-                                {
-                                    LargeImageKey = imageKey,
-                                    LargeImageText = "Spide"
-                                }
-                            });
-                        }
+                        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        object? timestamps = playing && duration > TimeSpan.Zero
+                            ? new { start = now - (long)position.TotalSeconds, end = now + (long)(duration - position).TotalSeconds }
+                            : null;
 
+                        var activity = new
+                        {
+                            type = 2,
+                            details = title,
+                            state = playing ? artist : $"{artist} • Paused",
+                            timestamps,
+                            assets = string.IsNullOrWhiteSpace(imageUrl) ? null : new
+                            {
+                                large_image = imageUrl,
+                                large_text = $"{title} — {artist}"
+                            }
+                        };
+
+                        await rpc.SetActivityAsync(activity);
                         lastFingerprint = fingerprint;
-                        hadPresence = true;
-                        Console.WriteLine($"{(isPlaying ? "▶" : "Ⅱ")} {title} — {artist}");
+                        Console.WriteLine($"{(playing ? "▶" : "Ⅱ")} {title} — {artist} [{session.SourceAppUserModelId}]");
                     }
                 }
             }
@@ -120,7 +101,47 @@ internal static class Program
                 Console.WriteLine($"Update error: {ex.Message}");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(2));
+            await Task.Delay(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static async Task<string?> GetArtworkUrlAsync(IRandomAccessStreamReference? thumbnail)
+    {
+        if (thumbnail is null) return null;
+
+        try
+        {
+            using var stream = await thumbnail.OpenReadAsync();
+            if (stream.Size == 0 || stream.Size > 8 * 1024 * 1024) return null;
+
+            var buffer = new Windows.Storage.Streams.Buffer(checked((uint)stream.Size));
+            await stream.ReadAsync(buffer, checked((uint)stream.Size), InputStreamOptions.None);
+            using var reader = DataReader.FromBuffer(buffer);
+            var bytes = new byte[buffer.Length];
+            reader.ReadBytes(bytes);
+
+            var hash = Convert.ToHexString(SHA256.HashData(bytes));
+            if (ArtworkCache.TryGetValue(hash, out var cached)) return cached;
+
+            using var form = new MultipartFormDataContent();
+            form.Add(new StringContent("fileupload"), "reqtype");
+            var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
+            var file = new ByteArrayContent(bytes);
+            form.Add(file, "fileToUpload", $"spide-cover.{extension}");
+
+            using var response = await Http.PostAsync("https://catbox.moe/user/api.php", form);
+            response.EnsureSuccessStatusCode();
+            var url = (await response.Content.ReadAsStringAsync()).Trim();
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeHttps)
+                return null;
+
+            ArtworkCache[hash] = url;
+            return url;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cover upload unavailable: {ex.Message}");
+            return null;
         }
     }
 
@@ -130,9 +151,91 @@ internal static class Program
         if (!File.Exists(path)) return null;
         try
         {
-            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            using var json = JsonDocument.Parse(File.ReadAllText(path));
             return json.RootElement.TryGetProperty(key, out var value) ? value.GetString() : null;
         }
         catch { return null; }
+    }
+
+    private sealed class DiscordIpcClient : IAsyncDisposable
+    {
+        private readonly string _appId;
+        private NamedPipeClientStream? _pipe;
+
+        public DiscordIpcClient(string appId) => _appId = appId;
+
+        public async Task<bool> ConnectAsync()
+        {
+            for (var i = 0; i < 10; i++)
+            {
+                var pipe = new NamedPipeClientStream(".", $"discord-ipc-{i}", PipeDirection.InOut, PipeOptions.Asynchronous);
+                try
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    await pipe.ConnectAsync(timeout.Token);
+                    _pipe = pipe;
+                    await WriteFrameAsync(0, new { v = 1, client_id = _appId });
+                    await ReadFrameAsync();
+                    return true;
+                }
+                catch
+                {
+                    pipe.Dispose();
+                    _pipe = null;
+                }
+            }
+            return false;
+        }
+
+        public Task SetActivityAsync(object? activity) =>
+            WriteFrameAsync(1, new
+            {
+                cmd = "SET_ACTIVITY",
+                args = new { pid = Environment.ProcessId, activity },
+                nonce = Guid.NewGuid().ToString("N")
+            });
+
+        private async Task WriteFrameAsync(int opcode, object payload)
+        {
+            if (_pipe is null) throw new IOException("Discord IPC is disconnected.");
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(payload);
+            var header = new byte[8];
+            BitConverter.GetBytes(opcode).CopyTo(header, 0);
+            BitConverter.GetBytes(bytes.Length).CopyTo(header, 4);
+            await _pipe.WriteAsync(header);
+            await _pipe.WriteAsync(bytes);
+            await _pipe.FlushAsync();
+        }
+
+        private async Task ReadFrameAsync()
+        {
+            if (_pipe is null) throw new IOException("Discord IPC is disconnected.");
+            var header = new byte[8];
+            await ReadExactlyAsync(_pipe, header);
+            var length = BitConverter.ToInt32(header, 4);
+            if (length < 0 || length > 1024 * 1024) throw new IOException("Invalid Discord IPC frame.");
+            var payload = new byte[length];
+            await ReadExactlyAsync(_pipe, payload);
+        }
+
+        private static async Task ReadExactlyAsync(Stream stream, byte[] buffer)
+        {
+            var offset = 0;
+            while (offset < buffer.Length)
+            {
+                var read = await stream.ReadAsync(buffer.AsMemory(offset));
+                if (read == 0) throw new EndOfStreamException();
+                offset += read;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_pipe is not null)
+            {
+                try { await SetActivityAsync(null); } catch { }
+                _pipe.Dispose();
+            }
+        }
     }
 }
