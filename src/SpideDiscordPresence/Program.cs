@@ -92,8 +92,7 @@ internal static class Program
                                 {
                                     LargeImageKey = imageKey,
                                     LargeImageText = "Spide"
-                                },
-                                Type = ActivityType.Listening
+                                }
                             });
                         }
                         else
@@ -106,8 +105,7 @@ internal static class Program
                                 {
                                     LargeImageKey = imageKey,
                                     LargeImageText = "Spide"
-                                },
-                                Type = ActivityType.Listening
+                                }
                             });
                         }
 
