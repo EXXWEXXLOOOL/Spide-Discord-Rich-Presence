@@ -81,13 +81,13 @@ internal static class Program
                         var activity = new
                         {
                             type = 2,
-                            details = title,
-                            state = playing ? artist : $"{artist} • Paused",
+                            details = $"♫ {title}",
+                            state = playing ? $"{artist} · Spide" : $"{artist} · Spide · Paused",
                             timestamps,
                             assets = string.IsNullOrWhiteSpace(imageUrl) ? null : new
                             {
                                 large_image = imageUrl,
-                                large_text = $"{title} — {artist}"
+                                large_text = $"♫ {title} — {artist}"
                             }
                         };
 
