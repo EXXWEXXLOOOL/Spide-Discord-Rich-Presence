@@ -11,6 +11,7 @@ internal static class Program
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(20) };
     private static readonly Dictionary<string, string> ArtworkCache = new();
+    private static readonly Dictionary<string, DateTimeOffset> ArtworkRetryAfter = new();
 
     private static async Task Main()
     {
@@ -122,27 +123,62 @@ internal static class Program
 
             var hash = Convert.ToHexString(SHA256.HashData(bytes));
             if (ArtworkCache.TryGetValue(hash, out var cached)) return cached;
-
-            using var form = new MultipartFormDataContent();
-            form.Add(new StringContent("fileupload"), "reqtype");
-            var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
-            var file = new ByteArrayContent(bytes);
-            form.Add(file, "fileToUpload", $"spide-cover.{extension}");
-
-            using var response = await Http.PostAsync("https://catbox.moe/user/api.php", form);
-            response.EnsureSuccessStatusCode();
-            var url = (await response.Content.ReadAsStringAsync()).Trim();
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeHttps)
+            if (ArtworkRetryAfter.TryGetValue(hash, out var retryAfter) && retryAfter > DateTimeOffset.UtcNow)
                 return null;
 
-            ArtworkCache[hash] = url;
-            return url;
+            var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
+
+            // Litterbox accepts anonymous uploads and returns a temporary public URL.
+            // Catbox is retained as a fallback in case the temporary-upload endpoint is unavailable.
+            foreach (var endpoint in new[]
+            {
+                ("https://litterbox.catbox.moe/resources/internals/api.php", true),
+                ("https://catbox.moe/user/api.php", false)
+            })
+            {
+                try
+                {
+                    using var form = new MultipartFormDataContent();
+                    form.Add(new StringContent("fileupload"), "reqtype");
+                    if (endpoint.Item2) form.Add(new StringContent("72h"), "time");
+                    var file = new ByteArrayContent(bytes);
+                    form.Add(file, "fileToUpload", $"spide-cover.{extension}");
+
+                    using var response = await Http.PostAsync(endpoint.Item1, form);
+                    var body = (await response.Content.ReadAsStringAsync()).Trim();
+                    response.EnsureSuccessStatusCode();
+                    if (!Uri.TryCreate(body, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeHttps)
+                        throw new IOException($"Image host returned an unexpected response: {body}");
+
+                    ArtworkCache[hash] = body;
+                    ArtworkRetryAfter.Remove(hash);
+                    Console.WriteLine("Track cover uploaded successfully.");
+                    return body;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Cover host {new Uri(endpoint.Item1).Host} failed: {DescribeException(ex)}");
+                }
+            }
+
+            // Avoid uploading the same failed cover every three seconds.
+            ArtworkRetryAfter[hash] = DateTimeOffset.UtcNow.AddMinutes(2);
+            Console.WriteLine("Cover upload paused for 2 minutes; track metadata will continue updating.");
+            return null;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Cover upload unavailable: {ex.Message}");
+            Console.WriteLine($"Could not read Spide cover: {DescribeException(ex)}");
             return null;
         }
+    }
+
+    private static string DescribeException(Exception ex)
+    {
+        var messages = new List<string>();
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+            messages.Add($"{current.GetType().Name}: {current.Message}");
+        return string.Join(" -> ", messages);
     }
 
     private static string? ReadSetting(string key)
