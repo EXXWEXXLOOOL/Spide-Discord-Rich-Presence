@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Net.Http;
 using System.Security.Cryptography;
@@ -9,9 +10,10 @@ namespace SpideDiscordPresence;
 
 internal static class Program
 {
-    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(20) };
-    private static readonly Dictionary<string, string> ArtworkCache = new();
-    private static readonly Dictionary<string, DateTimeOffset> ArtworkRetryAfter = new();
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(7) };
+    private static readonly ConcurrentDictionary<string, string> ArtworkCache = new();
+    private static readonly ConcurrentDictionary<string, DateTimeOffset> ArtworkRetryAfter = new();
+    private static readonly ConcurrentDictionary<string, byte> ArtworkUploads = new();
 
     private static async Task Main()
     {
@@ -126,10 +128,25 @@ internal static class Program
             if (ArtworkRetryAfter.TryGetValue(hash, out var retryAfter) && retryAfter > DateTimeOffset.UtcNow)
                 return null;
 
-            var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
+            // Upload in the background: track title, artist and timer must update immediately.
+            if (ArtworkUploads.TryAdd(hash, 0))
+            {
+                var extension = stream.ContentType.Contains("png", StringComparison.OrdinalIgnoreCase) ? "png" : "jpg";
+                _ = UploadArtworkAsync(bytes, hash, extension);
+            }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not read Spide cover: {DescribeException(ex)}");
+            return null;
+        }
+    }
 
-            // beacon.host returns a direct public file URL; anonymous links last 24 hours.
-            // Keep Litterbox and Catbox as fallbacks for networks where beacon.host is unavailable.
+    private static async Task UploadArtworkAsync(byte[] bytes, string hash, string extension)
+    {
+        try
+        {
             foreach (var host in new[] { "beacon", "litterbox", "catbox" })
             {
                 try
@@ -139,8 +156,7 @@ internal static class Program
                     if (host == "beacon")
                     {
                         endpoint = "https://beacon.host/v1/upload";
-                        var file = new ByteArrayContent(bytes);
-                        form.Add(file, "file", $"spide-cover.{extension}");
+                        form.Add(new ByteArrayContent(bytes), "file", $"spide-cover.{extension}");
                     }
                     else
                     {
@@ -149,22 +165,20 @@ internal static class Program
                             : "https://catbox.moe/user/api.php";
                         form.Add(new StringContent("fileupload"), "reqtype");
                         if (host == "litterbox") form.Add(new StringContent("72h"), "time");
-                        var file = new ByteArrayContent(bytes);
-                        form.Add(file, "fileToUpload", $"spide-cover.{extension}");
+                        form.Add(new ByteArrayContent(bytes), "fileToUpload", $"spide-cover.{extension}");
                     }
 
                     using var response = await Http.PostAsync(endpoint, form);
                     var body = (await response.Content.ReadAsStringAsync()).Trim();
                     if (!response.IsSuccessStatusCode)
                         throw new HttpRequestException($"HTTP {(int)response.StatusCode} ({response.StatusCode}): {body}");
-
                     if (!Uri.TryCreate(body, UriKind.Absolute, out var parsed) || parsed.Scheme != Uri.UriSchemeHttps)
                         throw new IOException($"Image host returned an unexpected response: {body}");
 
                     ArtworkCache[hash] = body;
-                    ArtworkRetryAfter.Remove(hash);
+                    ArtworkRetryAfter.TryRemove(hash, out _);
                     Console.WriteLine($"Track cover uploaded successfully via {host}.");
-                    return body;
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -172,15 +186,12 @@ internal static class Program
                 }
             }
 
-            // Avoid uploading the same failed cover every three seconds.
             ArtworkRetryAfter[hash] = DateTimeOffset.UtcNow.AddMinutes(2);
-            Console.WriteLine("Cover upload paused for 2 minutes; track metadata will continue updating.");
-            return null;
+            Console.WriteLine("Cover upload paused for 2 minutes; playback status is unaffected.");
         }
-        catch (Exception ex)
+        finally
         {
-            Console.WriteLine($"Could not read Spide cover: {DescribeException(ex)}");
-            return null;
+            ArtworkUploads.TryRemove(hash, out _);
         }
     }
 
